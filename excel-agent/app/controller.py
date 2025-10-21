@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
 import pandas as pd
+from fastapi import HTTPException
+
 from .schemas import (
     ControllerSummary, FileMetadata, SheetQuickSummary,
     SheetAIAnalysis, WorkbookAIOverview, AgentPayload
@@ -8,6 +10,12 @@ from .schemas import (
 from .utils import get_file_metadata
 from .xl_readers import load_workbook
 from .llm_client import analyze_sheet_with_ai, analyze_workbook_overview
+from .agent_service import run_excel_agent
+
+
+# ----------------------------------------------------------
+# 🧠 פונקציה ראשית – סיכום הקובץ והגיליונות
+# ----------------------------------------------------------
 
 def summarize_workbook(file_path: str):
     size, mime = get_file_metadata(file_path)
@@ -55,3 +63,26 @@ def summarize_workbook(file_path: str):
         workbook_ai=workbook_ai,
     )
     return controller_summary, ai_results, workbook_ai, agent_payload
+
+
+# ----------------------------------------------------------
+# 🤖 פונקציה חדשה – הרצת הסוכן על הקובץ
+# ----------------------------------------------------------
+
+def run_agent_on_excel(file_path: str, query: str):
+    """
+    מפעיל את סוכן ה-AI (LangChain ReAct) על קובץ Excel.
+    מקבל שאילתה חופשית ומחזיר תשובת AI על סמך הנתונים.
+    """
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+    controller_summary, _, _, _ = summarize_workbook(file_path)
+
+    # מפעיל את ה-Agent עם הנתיב והסיכום
+    try:
+        answer = run_excel_agent(file_path, controller_summary, query)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent failed: {e}")
+
+    return {"query": query, "answer": answer}
