@@ -5,6 +5,7 @@ from typing import Any, List, Dict
 import pandas as pd
 
 from .xl_readers import load_workbook
+from .ai_summaries import analyze_workbook_overview, analyze_sheet_with_ai
 
 # =========================
 # Helpers
@@ -115,7 +116,7 @@ def _first_label_cols(df: pd.DataFrame, k: int = 2) -> List[str]:
     return labels
 
 def _infer_total_row(df: pd.DataFrame, label_cols: List[str]) -> pd.DataFrame:
-    return _find_rows_by_label(df, label_cols, r"(?i)^\s*(total|sum)\b", regex=True)
+    return _find_rows_by_label(df, label_cols, r"(?i)^\s*(total|sum|סה\"כ|סך הכל)\b", regex=True)
 
 def _series_from_row_yearmap(row: pd.Series, info: Dict[str, Any]) -> List[Dict[str, Any]]:
     years = sorted(info["years"])
@@ -158,11 +159,17 @@ def summarize_sheet_tool(input_str: str) -> str:
         label_cols = d.get("label_columns") or _first_label_cols(df)
         total_df = _infer_total_row(df, label_cols)
         inferred_total = None
-        if not total_df.empty and years_info["years"]:
-            row = total_df.iloc[0]
-            series = _series_from_row_yearmap(row, years_info)
-            yoy = _yoy_from_series(series)
-            inferred_total = {"series": series, "yoy": yoy}
+        if not total_df.empty:
+            if years_info["years"]:
+                row = total_df.iloc[0]
+                series = _series_from_row_yearmap(row, years_info)
+                yoy = _yoy_from_series(series)
+                inferred_total = {"series": series, "yoy": yoy}
+            else:
+                # אין עמודות שנים — נחזיר סכום across כל העמודות המספריות
+                row = total_df.iloc[0]
+                nums = pd.to_numeric(row, errors="coerce")
+                inferred_total = {"total_all_numeric": float(nums.dropna().sum())}
 
         num_cols = _numeric_cols(df)
         numeric_stats = _basic_numeric_stats(df, num_cols)
@@ -176,7 +183,7 @@ def summarize_sheet_tool(input_str: str) -> str:
         highlights = []
         if years_info["years"]:
             highlights.append(f"Detected years: {', '.join(years_info['years'])}")
-        if inferred_total:
+        if inferred_total and "series" in inferred_total:
             last = inferred_total["series"][-1]["value"]
             highlights.append(f"Total (latest year): {last:,.2f}")
             if inferred_total["yoy"]:
@@ -213,6 +220,7 @@ def summarize_workbook_tool(input_str: str) -> str:
 
         xls = load_workbook(file_path)
         overview = []
+        previews = {}
         for name in xls.sheet_names:
             df = _normalize_columns(xls.parse(name))
             years_info = _detect_year_columns(df)
@@ -231,7 +239,10 @@ def summarize_workbook_tool(input_str: str) -> str:
                 "has_total": bool(has_total),
                 "notes": notes
             })
-        return json.dumps({"sheets": overview}, ensure_ascii=False)
+            previews[name] = df.head(12).to_csv(index=False)
+
+        semantic = analyze_workbook_overview(previews)  # purpose/key_entities/key_metrics/...
+        return json.dumps({"sheets": overview, "semantic": semantic}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"SummarizeWorkbook: {e}"}, ensure_ascii=False)
 
@@ -299,7 +310,7 @@ def totals_row_tool(input_str: str) -> str:
         d = _parse_json_input(input_str)
         df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
         label_cols = d.get("label_columns") or _first_label_cols(df)
-        total_regex = d.get("total_regex", r"(?i)total")
+        total_regex = d.get("total_regex", r"(?i)total|סה\"כ|סך הכל")
         cand = _find_rows_by_label(df, label_cols, total_regex, regex=True)
         if cand.empty:
             return json.dumps({"totals": None, "note": "No total row found"}, ensure_ascii=False)
@@ -308,19 +319,24 @@ def totals_row_tool(input_str: str) -> str:
         selection = {}
         cols_used = []
         row = cand.iloc[0]
-        for y in years:
-            cols = info["actual"].get(y) or info["map"].get(y) or []
-            if not cols:
-                continue
-            vals = []
-            for c in cols:
-                v = pd.to_numeric(pd.Series([row.get(c)]), errors="coerce").iloc[0]
-                if pd.notna(v):
-                    vals.append(float(v))
-                    cols_used.append(c)
-            if vals:
-                selection[y] = sum(vals)
-        return json.dumps({"totals": selection, "columns_used": cols_used}, ensure_ascii=False)
+        if years:
+            for y in years:
+                cols = info["actual"].get(y) or info["map"].get(y) or []
+                if not cols:
+                    continue
+                vals = []
+                for c in cols:
+                    v = pd.to_numeric(pd.Series([row.get(c)]), errors="coerce").iloc[0]
+                    if pd.notna(v):
+                        vals.append(float(v))
+                        cols_used.append(c)
+                if vals:
+                    selection[y] = sum(vals)
+            return json.dumps({"totals": selection, "columns_used": cols_used}, ensure_ascii=False)
+        else:
+            # ללא עמודות שנים — נחזיר סכום across עמודות מספריות
+            nums = pd.to_numeric(row, errors="coerce")
+            return json.dumps({"totals": {"all_numeric_sum": float(nums.dropna().sum())}}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"TotalsRow: {e}"}, ensure_ascii=False)
 
@@ -526,16 +542,32 @@ def filter_rows_tool(input_str: str) -> str:
         d = _parse_json_input(input_str)
         df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
         where = d.get("where") or []
+
+        def _normalize_cond(cond):
+            # explicit op
+            if "op" in cond:
+                return cond["op"], cond.get("value")
+            # shorthand ops
+            for k, op in [("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<="), ("eq", "=="), ("ne", "!=")]:
+                if k in cond:
+                    return op, cond[k]
+            return None, None
+
         for cond in where:
-            col, op, val = cond["column"], cond["op"], cond.get("value")
+            col = cond["column"]
+            op, val = _normalize_cond(cond)
+
             if op == "regex":
-                df = df[df[col].astype(str).str.contains(val, case=True, regex=True, na=False)]
-            elif op in (">", "<", ">=", "<=", "==", "!="):
+                val = cond.get("value", "")
+                df = df[df[col].astype(str).str.contains(val, regex=True, na=False)]
+                continue
+
+            if op in (">", "<", ">=", "<=", "==", "!="):
                 s = pd.to_numeric(df[col], errors="coerce")
-                expr = f"s {op} @val"
-                df = df[eval(expr)]
+                df = df[eval(f"s {op} @val")]
             else:
-                return json.dumps({"error": f"Unsupported op '{op}'"}, ensure_ascii=False)
+                return json.dumps({"error": f"Unsupported or missing operator for condition on '{col}'"}, ensure_ascii=False)
+
         select = d.get("select")
         if select:
             df = df[[c for c in select if c in df.columns]]
@@ -543,3 +575,87 @@ def filter_rows_tool(input_str: str) -> str:
         return json.dumps({"rows": df.head(limit).to_dict(orient="records")}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"FilterRows: {e}"}, ensure_ascii=False)
+
+
+# =========================
+# Tools — New (Structure & Semantics)
+# =========================
+def detect_total_columns_tool(input_str: str) -> str:
+    try:
+        d = _parse_json_input(input_str)
+        df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
+        cols = list(df.columns)
+        candidates = []
+        for c in cols:
+            lc = str(c).lower()
+            if any(k in lc for k in ["total", "sum", "all", "סה", "סך", "סה\"כ", "Σ"]):
+                candidates.append(str(c))
+        verified = []
+        for tc in candidates:
+            t = pd.to_numeric(df[tc], errors="coerce")
+            others = [c for c in cols if c != tc]
+            s = pd.to_numeric(df[others], errors="coerce").sum(axis=1)
+            # התאמה בקירוב (1% טולרנס)
+            match_rate = float(((t - s).abs() <= (abs(s) * 0.01 + 1e-9)).mean())
+            verified.append({"column": tc, "approx_sum_match_rate": match_rate})
+        return json.dumps({"candidates": verified}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"DetectTotalColumns: {e}"}, ensure_ascii=False)
+
+def detect_subtotal_rows_tool(input_str: str) -> str:
+    try:
+        d = _parse_json_input(input_str)
+        df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
+        label_cols = d.get("label_columns") or _first_label_cols(df)
+        subt = _find_rows_by_label(df, label_cols, r"(?i)\b(sub[- ]?total|תת[- ]?סך|ביניים)\b", regex=True)
+        return json.dumps({"rows": subt.to_dict(orient="records"), "idx": subt.index.tolist()}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"DetectSubtotalRows: {e}"}, ensure_ascii=False)
+
+def detect_tables_tool(input_str: str) -> str:
+    try:
+        d = _parse_json_input(input_str)
+        df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
+        # היוריסטיקה בסיסית: בלוקים מופרדים ע"י שורות ריקות
+        is_empty_row = df.isna().all(axis=1)
+        boundaries = [0]
+        for i in range(1, len(df)):
+            if is_empty_row.iloc[i] and not is_empty_row.iloc[i-1]:
+                boundaries.append(i)
+            if not is_empty_row.iloc[i] and is_empty_row.iloc[i-1]:
+                boundaries.append(i)
+        boundaries = sorted(set(boundaries + [len(df)]))
+
+        regions = []
+        for a, b in zip(boundaries[:-1], boundaries[1:]):
+            block = df.iloc[a:b]
+            if block.dropna(how="all").empty:
+                continue
+            header_idx = 0
+            cols = block.columns.tolist()
+            regions.append({
+                "top": int(a),
+                "bottom": int(b - 1),
+                "header_row": int(header_idx),
+                "columns": list(map(str, cols)),
+                "rows": int(len(block.dropna(how='all')))
+            })
+        return json.dumps({"regions": regions}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"DetectTables: {e}"}, ensure_ascii=False)
+
+def explain_sheet_purpose_tool(input_str: str) -> str:
+    """
+    LLM-עזר: 3–6 בולטים על מטרת הגיליון והישויות/מדדים בו.
+    """
+    try:
+        d = _parse_json_input(input_str)
+        file_path, sheet_name = d.get("file_path"), d.get("sheet_name")
+        if not file_path or not sheet_name:
+            return json.dumps({"error": "Provide file_path, sheet_name"}, ensure_ascii=False)
+        df = _normalize_columns(_load_df(file_path, sheet_name))
+        preview_csv = df.head(30).to_csv(index=False)
+        analysis = analyze_sheet_with_ai(sheet_name, preview_csv)
+        return json.dumps({"sheet": sheet_name, "analysis": analysis}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"ExplainSheetPurpose: {e}"}, ensure_ascii=False)
