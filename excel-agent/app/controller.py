@@ -1,13 +1,11 @@
+# app/controller.py
 from __future__ import annotations
-import os
-import uuid
-import base64
-import re
-import json
+import os, json, uuid, base64, re
 from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Body
+
 from .xl_readers import load_workbook
 from .agent_service import run_excel_agent, run_text_agent
 from .schemas import (
@@ -22,14 +20,12 @@ router = APIRouter()
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-
 def _unique_filename(original_name: str) -> str:
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     rand = uuid.uuid4().hex[:8]
     base, ext = os.path.splitext(original_name)
     safe_base = base.replace(" ", "_")
     return f"{stamp}_{rand}_{safe_base}{ext}"
-
 
 def _build_controller_summary(saved_path: str, original_name: str) -> ControllerSummary:
     xls = load_workbook(saved_path)
@@ -52,12 +48,11 @@ def _build_controller_summary(saved_path: str, original_name: str) -> Controller
     )
     return ControllerSummary(metadata=meta, per_sheet=per_sheet)
 
-
 # ---------- Heuristic: does the query REQUIRE the actual Excel data? ----------
 _REQUIRE_DATA_PATTERNS = re.compile(
-    r"(analy[sz]e|compute|calculate|find|list|show|extract|detect|"
+    r"(analy[sz]e|inspect|process|compute|calculate|find|list|show|extract|detect|"
     r"top|largest|variance|yoy|trend|pivot|vlookup|sum|avg|median|"
-    r"compare|correlate|forecast|outlier|inconsisten|mismatch)",
+    r"compare|correlate|forecast|outlier|inconsistent|mismatch)",
     re.IGNORECASE,
 )
 _EXCEL_TARGET_PATTERNS = re.compile(
@@ -74,11 +69,9 @@ def _query_requires_excel(text: str) -> bool:
         return True
     if _REQUIRE_DATA_PATTERNS.search(t) and _EXCEL_TARGET_PATTERNS.search(t):
         return True
-    # שאלות ידע (what/how/why/when/which) ללא רפרנס לקובץ → לא דורש קובץ
     if re.match(r"^\s*(what|how|why|when|which)\b", t, re.IGNORECASE):
         return False
     return False
-
 
 # ------------------------------ JSON-only: /chat/analyze ------------------------------
 @router.post("/chat/analyze")
@@ -96,23 +89,19 @@ async def chat_analyze(payload: ChatPayload = Body(...)):
 
     for msg in payload.messages:
         for part in msg.content:
-            if part.type == "text" and part.text:
+            if part.type == "text" and getattr(part, "text", None):
                 texts.append(part.text.strip())
-            elif part.type == "input_file" and part.file_data:
-                # נשתמש רק באקסל (נשמיט קבצים אחרים, למשל PDF)
+            elif part.type == "input_file" and getattr(part, "file_data", None):
                 mt = (part.file_data.mime_type or "").lower()
                 if "spreadsheetml" in mt and excel_file_bytes is None:
                     try:
-                        # נדרש Base64 מלא ללא 'data:;base64,' וללא '...'
                         excel_file_bytes = base64.b64decode(part.file_data.data)
                         excel_original_name = part.file_data.name or "uploaded.xlsx"
                     except Exception:
-                        # אם היוון שגוי, נמשיך כאילו לא הגיע קובץ
                         excel_file_bytes = None
 
     query = " ".join([t for t in texts if t]).strip() or "Analyze the Excel workbook."
 
-    # אם יש קובץ אקסל → ננתח
     if excel_file_bytes:
         try:
             original_name = excel_original_name or "uploaded.xlsx"
@@ -131,7 +120,6 @@ async def chat_analyze(payload: ChatPayload = Body(...)):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
-    # אין קובץ: נחליט אם צריך
     if _query_requires_excel(query):
         return {
             "agent_answer": (
@@ -140,7 +128,6 @@ async def chat_analyze(payload: ChatPayload = Body(...)):
             )
         }
 
-    # לא צריך קובץ -> תשובה קצרה ישירה
     try:
         direct_answer = run_text_agent(query)
         return {"agent_answer": direct_answer}

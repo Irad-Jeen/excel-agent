@@ -47,7 +47,6 @@ def _make_llm():
     )
 
 # ---------- Single-sheet semantic summary ----------
-
 SHEET_SYSTEM = (
     "You analyze Excel sheets. Be concise and specific. "
     "Given a small CSV preview, infer the sheet's purpose, main entities/metrics, and any obvious data issues. "
@@ -55,10 +54,6 @@ SHEET_SYSTEM = (
 )
 
 def analyze_sheet_with_ai(sheet_name: str, preview_csv: str) -> str:
-    """
-    Return a short bullet-style semantic analysis (3–6 bullets) for a sheet,
-    based on a small CSV preview (first rows).
-    """
     llm = _make_llm()
     messages = [
         SystemMessage(content=SHEET_SYSTEM),
@@ -71,28 +66,13 @@ def analyze_sheet_with_ai(sheet_name: str, preview_csv: str) -> str:
     resp = llm.invoke(messages)
     return (getattr(resp, "content", "") or "").strip()
 
-
 # ---------- Workbook-level semantic summary ----------
-
 WORKBOOK_SYSTEM = (
     "You are a data analyst. You receive previews for multiple Excel sheets (CSV snippets). "
     "Infer what the overall workbook is about. Be concrete and concise."
 )
 
 def analyze_workbook_overview(summaries: Dict[str, str]) -> Dict[str, List[str] | str]:
-    """
-    Input:
-      summaries: mapping sheet_name -> small CSV preview (e.g., df.head(12).to_csv())
-    Output:
-      dict with keys:
-        - purpose: str
-        - key_entities: List[str]
-        - key_metrics: List[str]
-        - time_ranges: List[str]
-        - data_quality_notes: List[str]
-        - suggested_questions: List[str]
-    If the model fails to return valid JSON, we fall back by putting the raw text into 'purpose'.
-    """
     llm = _make_llm()
     joined = "\n---\n".join([f"Sheet: {k}\n{v}" for k, v in summaries.items()])
     messages = [
@@ -114,7 +94,6 @@ def analyze_workbook_overview(summaries: Dict[str, str]) -> Dict[str, List[str] 
         for k in ["purpose","key_entities","key_metrics","time_ranges","data_quality_notes","suggested_questions"]:
             if k not in data:
                 data[k] = [] if k != "purpose" else ""
-        # Ensure correct types
         data["purpose"] = str(data.get("purpose", ""))
         for key in ["key_entities","key_metrics","time_ranges","data_quality_notes","suggested_questions"]:
             if not isinstance(data.get(key), list):
@@ -122,7 +101,6 @@ def analyze_workbook_overview(summaries: Dict[str, str]) -> Dict[str, List[str] 
             data[key] = [str(x) for x in data[key]]
         return data
     except Exception:
-        # Fallback: keep the model's raw text under purpose
         return {
             "purpose": text,
             "key_entities": [],

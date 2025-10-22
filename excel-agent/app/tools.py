@@ -1,3 +1,4 @@
+# app/tools.py
 from __future__ import annotations
 import json
 import re
@@ -140,7 +141,6 @@ def _yoy_from_series(series: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         yoy.append({"year": series[i]["year"], "delta": delta, "pct": pct})
     return yoy
 
-
 # =========================
 # Tools — Summaries (smart)
 # =========================
@@ -166,7 +166,6 @@ def summarize_sheet_tool(input_str: str) -> str:
                 yoy = _yoy_from_series(series)
                 inferred_total = {"series": series, "yoy": yoy}
             else:
-                # אין עמודות שנים — נחזיר סכום across כל העמודות המספריות
                 row = total_df.iloc[0]
                 nums = pd.to_numeric(row, errors="coerce")
                 inferred_total = {"total_all_numeric": float(nums.dropna().sum())}
@@ -241,11 +240,10 @@ def summarize_workbook_tool(input_str: str) -> str:
             })
             previews[name] = df.head(12).to_csv(index=False)
 
-        semantic = analyze_workbook_overview(previews)  # purpose/key_entities/key_metrics/...
+        semantic = analyze_workbook_overview(previews)
         return json.dumps({"sheets": overview, "semantic": semantic}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"SummarizeWorkbook: {e}"}, ensure_ascii=False)
-
 
 # =========================
 # Tools — Utilities
@@ -334,7 +332,6 @@ def totals_row_tool(input_str: str) -> str:
                     selection[y] = sum(vals)
             return json.dumps({"totals": selection, "columns_used": cols_used}, ensure_ascii=False)
         else:
-            # ללא עמודות שנים — נחזיר סכום across עמודות מספריות
             nums = pd.to_numeric(row, errors="coerce")
             return json.dumps({"totals": {"all_numeric_sum": float(nums.dropna().sum())}}, ensure_ascii=False)
     except Exception as e:
@@ -402,7 +399,6 @@ def quality_report_tool(input_str: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"QualityReport: {e}"}, ensure_ascii=False)
 
-
 # =========================
 # Tools — Computational
 # =========================
@@ -421,21 +417,39 @@ def compute_aggregate_tool(input_str: str) -> str:
         df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
         values = d.get("values")
         if not values:
-            return json.dumps({"error": "Provide 'values' list"}, ensure_ascii=False)
+            return json.dumps({"error": "ComputeAggregate: provide 'values' (list of COLUMN NAMES). Example: {\"values\":[\"Actual 2024\"]}"},
+                              ensure_ascii=False)
+
+        if any(not isinstance(c, str) for c in values):
+            return json.dumps({"error": "ComputeAggregate: 'values' must be column NAMES (strings), not raw numbers. Example: {\"values\":[\"Actual 2024\"]}"},
+                              ensure_ascii=False)
+
+        missing = [c for c in values if c not in df.columns]
+        if missing:
+            return json.dumps({"error": f"ComputeAggregate: columns not found: {missing}. "
+                                        f"Available (first 20): {list(map(str, df.columns))[:20]}"},
+                              ensure_ascii=False)
+
         agg = (d.get("agg") or "sum").lower()
         agg_map = {"sum":"sum","avg":"mean","mean":"mean","min":"min","max":"max","median":"median","count":"count"}
         if agg not in agg_map:
-            return json.dumps({"error": f"Unsupported agg '{agg}'"}, ensure_ascii=False)
+            return json.dumps({"error": f"ComputeAggregate: unsupported agg '{agg}'. Use one of {list(agg_map)}"},
+                              ensure_ascii=False)
 
         for c in values:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
         gb = d.get("group_by") or None
         if gb:
+            if any(g not in df.columns for g in gb):
+                bad = [g for g in gb if g not in df.columns]
+                return json.dumps({"error": f"ComputeAggregate: group_by columns not found: {bad}"},
+                                  ensure_ascii=False)
             out = getattr(df.groupby(gb)[values], agg_map[agg])().reset_index()
         else:
             out = getattr(df[values], agg_map[agg])()
             out = out.to_frame().T
+
         return json.dumps({"rows": out.to_dict(orient="records")}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"ComputeAggregate: {e}"}, ensure_ascii=False)
@@ -544,10 +558,8 @@ def filter_rows_tool(input_str: str) -> str:
         where = d.get("where") or []
 
         def _normalize_cond(cond):
-            # explicit op
             if "op" in cond:
                 return cond["op"], cond.get("value")
-            # shorthand ops
             for k, op in [("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<="), ("eq", "=="), ("ne", "!=")]:
                 if k in cond:
                     return op, cond[k]
@@ -576,7 +588,6 @@ def filter_rows_tool(input_str: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"FilterRows: {e}"}, ensure_ascii=False)
 
-
 # =========================
 # Tools — New (Structure & Semantics)
 # =========================
@@ -595,7 +606,6 @@ def detect_total_columns_tool(input_str: str) -> str:
             t = pd.to_numeric(df[tc], errors="coerce")
             others = [c for c in cols if c != tc]
             s = pd.to_numeric(df[others], errors="coerce").sum(axis=1)
-            # התאמה בקירוב (1% טולרנס)
             match_rate = float(((t - s).abs() <= (abs(s) * 0.01 + 1e-9)).mean())
             verified.append({"column": tc, "approx_sum_match_rate": match_rate})
         return json.dumps({"candidates": verified}, ensure_ascii=False)
@@ -616,7 +626,6 @@ def detect_tables_tool(input_str: str) -> str:
     try:
         d = _parse_json_input(input_str)
         df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
-        # היוריסטיקה בסיסית: בלוקים מופרדים ע"י שורות ריקות
         is_empty_row = df.isna().all(axis=1)
         boundaries = [0]
         for i in range(1, len(df)):
@@ -645,9 +654,6 @@ def detect_tables_tool(input_str: str) -> str:
         return json.dumps({"error": f"DetectTables: {e}"}, ensure_ascii=False)
 
 def explain_sheet_purpose_tool(input_str: str) -> str:
-    """
-    LLM-עזר: 3–6 בולטים על מטרת הגיליון והישויות/מדדים בו.
-    """
     try:
         d = _parse_json_input(input_str)
         file_path, sheet_name = d.get("file_path"), d.get("sheet_name")
@@ -659,3 +665,170 @@ def explain_sheet_purpose_tool(input_str: str) -> str:
         return json.dumps({"sheet": sheet_name, "analysis": analysis}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"ExplainSheetPurpose: {e}"}, ensure_ascii=False)
+
+# =========================
+# Tools — Meta (Docs)
+# =========================
+def _tool_specs() -> Dict[str, Any]:
+    return {
+        "SummarizeWorkbook": {
+            "purpose": "High-level workbook summary + semantic intent.",
+            "required": ["file_path"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx"},
+            "returns": {"sheets": "...", "semantic": "..."}
+        },
+        "SummarizeSheet": {
+            "purpose": "Smart sheet summary: columns, totals detection, YoY, stats, quality, preview.",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["label_columns"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY"},
+            "returns": {"columns": "...", "years_info": "...", "inferred_total": "...", "preview_first_20": "..."}
+        },
+        "ExplainSheetPurpose": {
+            "purpose": "3–6 bullets: semantic purpose of a sheet from preview.",
+            "required": ["file_path", "sheet_name"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY"},
+            "returns": {"sheet": "...", "analysis": "..."}
+        },
+        "ListSheets": {
+            "purpose": "List sheet names in workbook.",
+            "required": ["file_path"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx"},
+            "returns": {"sheets": ["..."]}
+        },
+        "SheetColumns": {
+            "purpose": "Return column headers of a sheet.",
+            "required": ["file_path", "sheet_name"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY"},
+            "returns": {"columns": ["..."]}
+        },
+        "SheetPreview": {
+            "purpose": "Return first N rows (records).",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["n"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY", "n": 10},
+            "returns": {"rows": [{"col": "..."}, "..."]}
+        },
+        "DetectYearColumns": {
+            "purpose": "Detect year columns and classify as 'actual' / 'budget'.",
+            "required": ["file_path", "sheet_name"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY"},
+            "returns": {"years": ["2021","2022","..."], "actual": {"2024": ["Actual 2024"]}}
+        },
+        "DetectTables": {
+            "purpose": "Detect multiple table regions (by blank row blocks).",
+            "required": ["file_path", "sheet_name"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "Sheet1"},
+            "returns": {"regions": [{"top":0,"bottom":20,"columns":[...]}]}
+        },
+        "FindRows": {
+            "purpose": "Find rows by label regex/exact in label columns.",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["label_columns", "query", "regex"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY", "label_columns": ["Category (Level 1)", "Subcategory (Level 2)"], "query": "(?i)^Total Expenses$", "regex": True},
+            "returns": {"matched": [{"...": "..."}], "idx": [0,1]}
+        },
+        "TotalsRow": {
+            "purpose": "Locate a total row and return per-year totals (if years exist).",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["label_columns", "total_regex"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY", "total_regex": "(?i)^Total Expenses$"},
+            "returns": {"totals": {"2024": 494}}
+        },
+        "YoYForLabel": {
+            "purpose": "YoY series for a label row across detected years.",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["label_columns", "label_query", "regex"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY", "label_query": "(?i)^Total Expenses$"},
+            "returns": {"series":[{"year":2024,"value":494}],"yoy":[...]}
+        },
+        "QualityReport": {
+            "purpose": "Nulls per column + numeric parse rates.",
+            "required": ["file_path", "sheet_name"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY"},
+            "returns": {"row_count": 50, "numeric_parse_rate": {"Actual 2024": 1.0}}
+        },
+        "DetectTotalColumns": {
+            "purpose": "Find total-like columns and approx sum match rate.",
+            "required": ["file_path", "sheet_name"],
+            "optional": [],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "Sheet1"},
+            "returns": {"candidates": [{"column":"Total","approx_sum_match_rate":0.97}]}
+        },
+        "DetectSubtotalRows": {
+            "purpose": "Detect subtotal rows by heuristics.",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["label_columns"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "Sheet1"},
+            "returns": {"rows": [{"...":"..."}]}
+        },
+        "ColumnStats": {
+            "purpose": "Basic numeric stats per given columns (or inferred numeric).",
+            "required": ["file_path", "sheet_name"],
+            "optional": ["columns"],
+            "example_input": {"file_path": "/path/file.xlsx", "sheet_name": "P&L Insurance YOY", "columns": ["Actual 2024"]},
+            "returns": {"stats": {"Actual 2024": {"mean": 47.64}}}
+        },
+        "ComputeAggregate": {
+            "purpose": "Aggregate numeric columns. IMPORTANT: 'values' must be column NAMES, not raw numbers.",
+            "required": ["file_path","sheet_name","values"],
+            "optional": ["group_by","agg"],
+            "example_input": {"file_path":"/path/file.xlsx","sheet_name":"P&L Insurance YOY","values":["Actual 2024"],"agg":"sum"},
+            "returns": {"rows":[{"Actual 2024": 494}]}
+        },
+        "ComputeRatio": {
+            "purpose": "Compute ratio between two columns OR between labeled totals.",
+            "required": ["file_path","sheet_name"],
+            "optional": ["numerator_col","denominator_col","label_columns","numerator_label","denominator_label"],
+            "example_input": {"file_path":"/path.xlsx","sheet_name":"P&L Insurance YOY","numerator_label":"(?i)^Total Revenues$","denominator_label":"(?i)^Total Expenses$"},
+            "returns": {"ratio": 0.83, "details": {"numerator":..., "denominator":...}}
+        },
+        "YoYTable": {
+            "purpose": "YoY for many labels (optionally label_regex).",
+            "required": ["file_path","sheet_name"],
+            "optional": ["label_columns","label_regex"],
+            "example_input": {"file_path":"/path.xlsx","sheet_name":"P&L Insurance YOY","label_regex":"(?i)Expenses|Revenues"},
+            "returns": {"rows":[{"label":"Total Expenses","series":[...]}]}
+        },
+        "TopNChanges": {
+            "purpose": "Top-N YoY deltas by absolute change.",
+            "required": ["file_path","sheet_name"],
+            "optional": ["label_columns","n"],
+            "example_input": {"file_path":"/path.xlsx","sheet_name":"P&L Insurance YOY","n":10},
+            "returns": {"top":[{"label":"...","year":2024,"delta":...}]}
+        },
+        "PivotMini": {
+            "purpose": "Minimal pivot.",
+            "required": ["file_path","sheet_name","values"],
+            "optional": ["index","columns","agg"],
+            "example_input": {"file_path":"/path.xlsx","sheet_name":"P&L Insurance YOY","index":["Category (Level 1)"],"values":["Actual 2024"],"agg":"sum"},
+            "returns": {"rows":[{"Category (Level 1)":"Expenses","Actual 2024":494}]}
+        },
+        "FilterRows": {
+            "purpose": "Filter by numeric comparisons or regex; then select and limit.",
+            "required": ["file_path","sheet_name"],
+            "optional": ["where","select","limit"],
+            "example_input": {"file_path":"/path.xlsx","sheet_name":"P&L Insurance YOY","where":[{"column":"Category (Level 1)","op":"regex","value":"^(?i)\\s*Expenses\\s*$"}],"select":["Category (Level 1)","Actual 2024"],"limit":1000},
+            "returns": {"rows":[{"Category (Level 1)":"Expenses","Actual 2024":...}]}
+        },
+    }
+
+def describe_tools_tool(input_str: str) -> str:
+    try:
+        d = _parse_json_input(input_str)
+        names = d.get("names")
+        specs = _tool_specs()
+        if names:
+            out = {k: specs[k] for k in names if k in specs}
+        else:
+            out = specs
+        return json.dumps({"tools": out}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"DescribeTools: {e}"}, ensure_ascii=False)

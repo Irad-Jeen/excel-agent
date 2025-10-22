@@ -1,15 +1,14 @@
 # app/agent_service.py
 from __future__ import annotations
-import os, json
-from typing import Any, Dict, Callable
+import os, json, re, ast
+from typing import Any, Dict, Callable, Union
 from langchain.agents import create_react_agent, AgentExecutor, Tool
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
-from langchain_core.prompts import ChatPromptTemplate
 
 from .schemas import ControllerSummary
 
-# כלים מקוריים
+# ====== ייבוא הכלים ======
 from .tools import (
     summarize_workbook_tool,
     summarize_sheet_tool,
@@ -32,10 +31,11 @@ from .tools import (
     detect_subtotal_rows_tool,
     detect_tables_tool,
     explain_sheet_purpose_tool,
+    describe_tools_tool,
 )
 
 # =========================
-# LLM: Gemma via OpenRouter
+# LLM: Gemma via OpenRouter  (עם stop tokens נגד ``` וקוד-פנסינג)
 # =========================
 def _make_llm():
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -49,27 +49,53 @@ def _make_llm():
         "HTTP-Referer": os.getenv("HTTP_REFERER", "http://localhost:8000"),
         "X-Title": os.getenv("X_TITLE", "Excel-Agent"),
     }
+    # ✅ stop מונע מהמודל לפתוח/לסגור ``` וליפול על parser
     return ChatOpenAI(
         model=model,
         base_url=base_url,
         openai_api_key=api_key,
         default_headers=headers,
-        temperature=0.2,
+        temperature=0.0,
         timeout=90,
+        stop=["```", "\n```", "```json", "```JSON"],
     )
 
 # =========================
-# Router Tool — Invoke
+# Router Tool — Invoke (סלחן ל-JSON “מלוכלך”)
 # =========================
 def _normalize_tool_name(name: str) -> str:
     if not name:
         return ""
-    t = name.strip().strip("`").strip('"').strip("'")
+    t = str(name).strip().strip("`").strip('"').strip("'")
     if t.lower().startswith("action:"):
         t = t.split(":", 1)[-1].strip()
     return t
 
-# מיפוי שם->פונקציה (שמור על סנכרון עם הכלים)
+TOOL_ALIASES = {
+    "describetools": "DescribeTools",
+    "listsheets": "ListSheets",
+    "sheetcolumns": "SheetColumns",
+    "columns": "SheetColumns",
+    "sheetpreview": "SheetPreview",
+    "detectyearcolumns": "DetectYearColumns",
+    "detecttables": "DetectTables",
+    "findrows": "FindRows",
+    "totalsrow": "TotalsRow",
+    "yoyforlabel": "YoYForLabel",
+    "qualityreport": "QualityReport",
+    "detecttotalcolumns": "DetectTotalColumns",
+    "detectsubtotalrows": "DetectSubtotalRows",
+    "columnstats": "ColumnStats",
+    "computeaggregate": "ComputeAggregate",
+    "computeratio": "ComputeRatio",
+    "yoytable": "YoYTable",
+    "topnchanges": "TopNChanges",
+    "pivotmini": "PivotMini",
+    "filterrows": "FilterRows",
+    "detectyear": "DetectYearColumns",
+    "preview": "SheetPreview",
+}
+
 TOOL_REGISTRY: Dict[str, Callable[[str], str]] = {
     "SummarizeWorkbook":      summarize_workbook_tool,
     "SummarizeSheet":         summarize_sheet_tool,
@@ -92,27 +118,55 @@ TOOL_REGISTRY: Dict[str, Callable[[str], str]] = {
     "TopNChanges":            topn_changes_tool,
     "PivotMini":              pivot_mini_tool,
     "FilterRows":             filter_rows_tool,
+    "DescribeTools":          describe_tools_tool,
 }
 
-def _invoke_router(input_str: str) -> str:
-    """
-    קלט צפוי (מחרוזת JSON):
-    {"tool":"SheetColumns","input":{"file_path":"...","sheet_name":"..."}}
-    """
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+def _coerce_to_dict(input_data: Union[str, dict]) -> Dict[str, Any]:
+    if isinstance(input_data, dict):
+        return input_data
+    s = (input_data or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+    s = s.replace("\u200b", "").strip()
+    m = _JSON_OBJECT_RE.search(s)
+    if m:
+        s = m.group(0).strip()
     try:
-        data = json.loads((input_str or "").strip() or "{}")
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        maybe = ast.literal_eval(s)
+        if isinstance(maybe, dict):
+            return maybe
+    except Exception:
+        pass
+    try:
+        s2 = re.sub(r"(?<!\\)'", '"', s)
+        return json.loads(s2)
     except Exception as e:
-        return json.dumps({"error": f"Invoke: invalid JSON string input. {e}"}, ensure_ascii=False)
+        raise ValueError(f"Invoke: invalid JSON string input. {e}")
+
+def _invoke_router(input_any: Union[str, Dict[str, Any]]) -> str:
+    try:
+        data = _coerce_to_dict(input_any)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     tool_name = _normalize_tool_name(str(data.get("tool", "")))
+    tool_name = TOOL_ALIASES.get(tool_name.replace(" ", "").lower(), tool_name)
     tool_input = data.get("input")
 
     if not tool_name:
         return json.dumps({"error": "Invoke: missing 'tool'."}, ensure_ascii=False)
     if tool_name not in TOOL_REGISTRY:
-        return json.dumps({"error": f"Invoke: unknown tool '{tool_name}'."}, ensure_ascii=False)
+        return json.dumps({
+            "error": f"Invoke: unknown tool '{tool_name}'.",
+            "hint": f"Use one of: {sorted(TOOL_REGISTRY.keys())}"
+        }, ensure_ascii=False)
 
-    # הכלים שלנו מצפים תמיד למחרוזת JSON (string), לא ל-dict
     if isinstance(tool_input, dict):
         tool_input = json.dumps(tool_input, ensure_ascii=False)
     elif tool_input is None:
@@ -132,48 +186,52 @@ def _invoke_router(input_str: str) -> str:
 def create_excel_agent() -> AgentExecutor:
     llm = _make_llm()
 
-    # נחשוף למודל רק כלי אחד — Invoke — והוא יעשה dispatch לכל השאר.
     tools = [
         Tool(
             name="Invoke",
             func=_invoke_router,
             description=(
                 "Call any Excel tool via a router.\n"
-                "INPUT (JSON string): {\"tool\":\"<One of: "
+                "INPUT: either a JSON object or a JSON string with fields {tool, input}.\n"
+                "Format: {\"tool\":\"<One of: "
                 + ", ".join(sorted(TOOL_REGISTRY.keys()))
                 + ">\", \"input\": {<tool-args>}}\n"
-                "Example: {\"tool\":\"SheetColumns\",\"input\":{\"file_path\":\"/path.xlsx\",\"sheet_name\":\"P&L Insurance YOY\"}}"
+                "Example (object): {\"tool\":\"SheetColumns\",\"input\":{\"file_path\":\"/path.xlsx\",\"sheet_name\":\"P&L Insurance YOY\"}}\n"
+                "Example (string): \"{\\\"tool\\\":\\\"SheetColumns\\\",\\\"input\\\":{\\\"file_path\\\":\\\"/path.xlsx\\\",\\\"sheet_name\\\":\\\"P&L Insurance YOY\\\"}}\""
             ),
         )
     ]
 
+    # ✅ פרומפט מוקשח — אין פנסינג, אין טקסט מסביב, 4 שורות בלבד
     template = """You are an expert Excel analyst. Use the single tool "Invoke" to run any operation.
 
 AVAILABLE TOOLS (via Invoke):
 {tools}
 
-IMPORTANT CALL FORMAT (no backticks anywhere):
-Thought: what you need to do
+FORMAT (produce exactly these 4 blocks, no extras, no code fences, no markdown):
+Thought: brief reasoning
 Action: Invoke
-Action Input: a single JSON string like "{{\"tool\":\"SheetColumns\",\"input\":{{\"file_path\":\"/path.xlsx\",\"sheet_name\":\"P&L Insurance YOY\"}}}}"
-Observation: the tool JSON result
-... (iterate Thought/Action/Action Input/Observation)
-Final Answer: concise answer; include a small inline JSON object if numeric results are central (no code fences).
+Action Input: {{"tool":"<OneOf:{tool_names}>","input":{{"file_path":"{example_path}","sheet_name":"<SheetNameOrOtherArgs>"}}}}
+Observation: (the tool JSON result will appear here; then continue if needed)
 
 Rules:
-- Always use Action: Invoke (exactly). Never call other tool names directly.
-- In Action Input, 'tool' must be one of: {tool_names}.
-- 'input' may be a JSON object; the router will stringify it for the target tool.
-- If a tool fails, read the error JSON and try a corrective next step (e.g., fix sheet_name).
+- NEVER use backticks or code fences.
+- NEVER include extra prose on the Action Input line; it must be a raw JSON object.
+- If a tool fails, read its error JSON and try a corrective next step.
+- Finish with: Final Answer: <concise answer to the user>.
 
 Question:
 {input}
 
 {agent_scratchpad}"""
 
+    example_path = "/path/to/workbook.xlsx"
+    tool_names = ", ".join(sorted(TOOL_REGISTRY.keys()))
+
     prompt = PromptTemplate(
         template=template,
-        input_variables=["input", "tools", "tool_names", "agent_scratchpad"],
+        input_variables=["input", "tools", "agent_scratchpad"],
+        partial_variables={"example_path": example_path, "tool_names": tool_names},
     )
 
     agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
@@ -182,9 +240,13 @@ Question:
         agent=agent,
         tools=tools,
         verbose=True,
+        max_iterations=8,                  # לא להסתחרר בלופים
+        early_stopping_method="generate",  # אם נתקע, לייצר Final Answer
         handle_parsing_errors=(
-            "Your last message did not follow the tool-call format. "
-            "Use ONLY:\nThought\nAction: Invoke\nAction Input: \"{\\\"tool\\\":\\\"<ToolName>\\\",\\\"input\\\":{...}}\""
+            "Your last message did not follow the exact 4-block format.\n"
+            "Produce ONLY:\n"
+            "Thought: ...\nAction: Invoke\nAction Input: {\"tool\":\"<ToolName>\",\"input\":{...}}\nObservation: ...\n"
+            "No backticks. No code fences. No extra prose around Action Input."
         ),
     )
     return executor
@@ -213,6 +275,7 @@ User Query: {query}"""
 # =========================
 def run_text_agent(query: str) -> str:
     llm = _make_llm()
+    from langchain_core.prompts import ChatPromptTemplate
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
