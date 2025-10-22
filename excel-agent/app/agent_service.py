@@ -1,14 +1,33 @@
 from __future__ import annotations
 import os
-import json
 from typing import Any
 from langchain.agents import create_react_agent, AgentExecutor, Tool
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain_core.prompts import ChatPromptTemplate
-from .xl_readers import load_workbook
+
 from .schemas import ControllerSummary
 
+# ייבוא כל הפונקציות מקובץ הכלים
+from .tools import (
+    summarize_workbook_tool,
+    summarize_sheet_tool,
+    list_sheets_tool,
+    sheet_columns_tool,
+    sheet_preview_tool,
+    detect_year_columns_tool,
+    find_rows_tool,
+    totals_row_tool,
+    yoy_for_label_tool,
+    quality_report_tool,
+    column_stats_tool,
+    compute_aggregate_tool,
+    compute_ratio_tool,
+    yoy_table_tool,
+    topn_changes_tool,
+    pivot_mini_tool,
+    filter_rows_tool,
+)
 
 # =========================
 # LLM: Gemma via OpenRouter
@@ -17,11 +36,9 @@ def _make_llm():
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("❌ Missing OPENROUTER_API_KEY in environment!")
-
     model = os.getenv("OPENROUTER_MODEL", "google/gemma-3-12b-it")
     if "gemma" not in model.lower():
         raise ValueError(f"❌ Invalid model: {model} — must be Gemma only!")
-
     base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     headers = {
         "HTTP-Referer": os.getenv("HTTP_REFERER", "http://localhost:8000"),
@@ -36,68 +53,6 @@ def _make_llm():
         timeout=90,
     )
 
-
-# =========================
-# Tools (single string input)
-# =========================
-def _parse_json_input(input_str: str) -> dict:
-    input_str = (input_str or "").strip()
-    if not input_str:
-        return {}
-    try:
-        return json.loads(input_str)
-    except Exception as e:
-        raise ValueError(f"Tool expected JSON string input, got: {input_str!r}. Error: {e}")
-
-def summarize_sheet_tool(input_str: str) -> str:
-    """
-    Expect JSON: {"file_path": "...", "sheet_name": "..."}
-    """
-    try:
-        data = _parse_json_input(input_str)
-        file_path = data.get("file_path")
-        sheet_name = data.get("sheet_name")
-        if not file_path or not sheet_name:
-            return "❌ Missing required keys. Provide JSON with keys: file_path, sheet_name."
-
-        xls = load_workbook(file_path)
-        if sheet_name not in xls.sheet_names:
-            return f"❌ Sheet '{sheet_name}' not found. Available: {xls.sheet_names}"
-
-        import pandas as pd
-        df = xls.parse(sheet_name)
-        preview = df.head(20).to_csv(index=False)
-        return (
-            f"📊 Sheet: {sheet_name}\n"
-            f"Columns: {', '.join(map(str, df.columns))}\n"
-            f"Rows: {len(df)}\n\nPreview (first 20 rows):\n{preview}"
-        )
-    except Exception as e:
-        return f"❌ Error in SummarizeSheet: {e}"
-
-def summarize_workbook_tool(input_str: str) -> str:
-    """
-    Expect JSON: {"file_path": "..."}
-    """
-    try:
-        data = _parse_json_input(input_str)
-        file_path = data.get("file_path")
-        if not file_path:
-            return "❌ Missing required key 'file_path' in JSON."
-
-        xls = load_workbook(file_path)
-        parts = []
-        for name in xls.sheet_names:
-            df = xls.parse(name)
-            parts.append(
-                f"Sheet: {name} | rows={len(df)} | cols={len(df.columns)} | "
-                f"columns={', '.join(map(str, df.columns))}"
-            )
-        return "\n".join(parts)
-    except Exception as e:
-        return f"❌ Error in SummarizeWorkbook: {e}"
-
-
 # =========================
 # Create ReAct Agent
 # =========================
@@ -105,41 +60,54 @@ def create_excel_agent() -> AgentExecutor:
     llm = _make_llm()
 
     tools = [
-        Tool(
-            name="SummarizeWorkbook",
-            func=summarize_workbook_tool,
-            description=(
-                "Summarize the structure of an Excel workbook: list sheets, row/col counts, and columns. "
-                "INPUT MUST BE JSON like: {\"file_path\":\"/path/to/file.xlsx\"}."
-            ),
-        ),
-        Tool(
-            name="SummarizeSheet",
-            func=summarize_sheet_tool,
-            description=(
-                "Summarize a specific sheet in the Excel file (columns, rows, small preview). "
-                "INPUT MUST BE JSON like: {\"file_path\":\"/path/to/file.xlsx\",\"sheet_name\":\"P&L Insurance YOY\"}."
-            ),
-        ),
+        # Smart summaries
+        Tool(name="SummarizeWorkbook", func=summarize_workbook_tool,
+             description="Summarize workbook structure and quick insights. INPUT: {\"file_path\":\"/path/to/file.xlsx\"}."),
+        Tool(name="SummarizeSheet", func=summarize_sheet_tool,
+             description="Smart sheet summary: columns, totals detection, YOY, numeric stats, quality, highlights. INPUT: {\"file_path\":\"/path/to/file.xlsx\",\"sheet_name\":\"<name>\"}."),
+
+        # Utilities
+        Tool(name="ListSheets",        func=list_sheets_tool,        description="List sheet names. INPUT: {\"file_path\":\"...\"}."),
+        Tool(name="SheetColumns",      func=sheet_columns_tool,      description="Return headers. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\"}."),
+        Tool(name="SheetPreview",      func=sheet_preview_tool,      description="First N rows. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"n\":10}."),
+        Tool(name="DetectYearColumns", func=detect_year_columns_tool,description="Detect year columns. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\"}."),
+        Tool(name="FindRows",          func=find_rows_tool,          description="Find rows by label regex. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"label_columns\":[...],\"query\":\"...\"}."),
+        Tool(name="TotalsRow",         func=totals_row_tool,         description="Locate 'Total' row and return values per year. INPUT: {...}."),
+        Tool(name="YoYForLabel",       func=yoy_for_label_tool,      description="Compute YoY for a label row. INPUT: {...}."),
+        Tool(name="QualityReport",     func=quality_report_tool,     description="Nulls and numeric parse rate. INPUT: {...}."),
+
+        # Computational
+        Tool(name="ColumnStats",       func=column_stats_tool,       description="Numeric stats per column. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"columns\":[...]}."),
+        Tool(name="ComputeAggregate",  func=compute_aggregate_tool,  description="Group & aggregate. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"group_by\":[...],\"values\":[...],\"agg\":\"sum|avg|min|max|median|count\"}."),
+        Tool(name="ComputeRatio",      func=compute_ratio_tool,      description="Ratio of columns or totals by label. INPUT: {...}."),
+        Tool(name="YoYTable",          func=yoy_table_tool,          description="YoY for many labels. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"label_columns\":[...],\"label_regex\":\"...\"}."),
+        Tool(name="TopNChanges",       func=topn_changes_tool,       description="Top-N YoY deltas. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"n\":10}."),
+        Tool(name="PivotMini",         func=pivot_mini_tool,         description="Minimal pivot. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"index\":[...],\"columns\":[...],\"values\":[...],\"agg\":\"sum\"}."),
+        Tool(name="FilterRows",        func=filter_rows_tool,        description="Generic filtering. INPUT: {\"file_path\":\"...\",\"sheet_name\":\"...\",\"where\":[...],\"select\":[...],\"limit\":50}."),
     ]
 
-    template = """You are an expert Excel analyst. You have tools you can call.
+    template = """You are an expert Excel analyst. Use tools when the query requires file-specific data.
 
 TOOLS:
 {tools}
 
-When you need to use a tool, follow EXACTLY this format:
+Call tools with EXACTLY this format:
 Thought: what you think you need to do
 Action: the tool name (one of: {tool_names})
 Action Input: a single JSON string with the tool arguments
-Observation: the tool result
+Observation: the tool result (JSON string)
 ... (repeat Thought/Action/Action Input/Observation as needed)
-Final Answer: a concise, helpful answer to the user's question.
+Final Answer: a concise answer. If numeric results are central, include a short JSON object inline (no code fences).
 
 IMPORTANT:
 - Tools expect a JSON string as Action Input. Do NOT pass Python dicts. Do NOT pass plain text.
-- For SummarizeWorkbook, pass: {{ "file_path": "<path>" }}.
-- For SummarizeSheet, pass: {{ "file_path": "<path>", "sheet_name": "<sheet>" }}.
+- Prefer these flows:
+  • ListSheets -> SheetColumns/SheetPreview
+  • DetectYearColumns -> TotalsRow / YoYForLabel
+  • For analysis: YoYTable / TopNChanges / ComputeAggregate / ComputeRatio / PivotMini
+  • Use QualityReport when data issues are suspected.
+- Never use markdown code fences in your Final Answer.
+- If a tool fails or data is insufficient, explain clearly and suggest the next best tool.
 
 Question:
 {input}
@@ -152,16 +120,21 @@ Question:
     )
 
     agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-    return executor
 
+    executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        handle_parsing_errors=True,
+        # return_intermediate_steps=True,
+    )
+    return executor
 
 # =========================
 # Run Excel agent
 # =========================
 def run_excel_agent(file_path: str, controller_summary: ControllerSummary, query: str) -> str:
     agent = create_excel_agent()
-
     context = f"""You are analyzing an Excel workbook uploaded by the user.
 
 Here is the controller summary (metadata and per-sheet structure):
@@ -170,33 +143,27 @@ Here is the controller summary (metadata and per-sheet structure):
 When you need details, use the tools with JSON input as documented.
 File path to use: {file_path}
 User Query: {query}"""
-
     try:
-        result = agent.invoke({"input": context})
+        result = agent.invoke({"input": context}, handle_parsing_errors=True)
         return result.get("output", "❌ No output returned from agent.")
     except Exception as e:
         return f"❌ Agent failed to process query: {e}"
 
-
 # =========================
-# Run text-only agent (no Excel required)
+# Run text-only agent
 # =========================
 def run_text_agent(query: str) -> str:
-    """
-    Answers general questions that do NOT require reading an Excel file.
-    Output is short (<= 120 words).
-    """
     llm = _make_llm()
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
              "You are a concise business analyst. "
              "If the user's question can be answered without reading a file, answer directly in under 120 words. "
-             "If the question clearly requires specific data from a file, briefly state what data is needed."),
+             "If the question clearly requires specific data from a file, briefly state what data is needed. "
+             "Never use markdown code fences in your final output."),
             ("user", "{q}"),
         ]
     )
     chain = prompt | llm
     msg = chain.invoke({"q": query})
-    # ChatOpenAI via LangChain returns an AIMessage with .content
     return getattr(msg, "content", "").strip() or "Done."
