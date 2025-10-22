@@ -1,40 +1,54 @@
 from __future__ import annotations
-from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Literal, Optional, Union
+from pydantic import BaseModel, Field
 
-class SheetQuickSummary(BaseModel):
+
+# ---------------------------- Controller Summary ----------------------------
+
+class ControllerMetadata(BaseModel):
+    filename: str
+    size_bytes: int
+    mime_type: str
+    original_name: Optional[str] = None
+
+
+class ControllerSheetSummary(BaseModel):
     name: str
     n_rows: int
     n_cols: int
     columns: List[str]
 
-class SheetAIAnalysis(BaseModel):
-    sheet: str
-    analysis: str
-
-class FileMetadata(BaseModel):
-    filename: str
-    size_bytes: int
-    mime_type: Optional[str] = None
 
 class ControllerSummary(BaseModel):
-    metadata: FileMetadata
-    per_sheet: List[SheetQuickSummary]
+    metadata: ControllerMetadata
+    per_sheet: List[ControllerSheetSummary]
 
-class WorkbookAIOverview(BaseModel):
-    purpose: str
-    key_entities: List[str] = []
-    key_metrics: List[str] = []
-    time_ranges: List[str] = []
-    data_quality_notes: List[str] = []
-    suggested_questions: List[str] = []
 
-class AnalyzeResponse(BaseModel):
-    controller_summary: ControllerSummary
-    per_sheet_ai: List[SheetAIAnalysis]
-    workbook_ai: WorkbookAIOverview
+# ---------------------------- Chat Payload (Task #2) ----------------------------
 
-class AgentPayload(BaseModel):
-    file_path: str
-    controller_summary: ControllerSummary
-    workbook_ai: WorkbookAIOverview
+class FileData(BaseModel):
+    name: Optional[str] = None
+    mime_type: Optional[str] = None
+    data: str  # base64 string
+
+
+class ContentItemText(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ContentItemFile(BaseModel):
+    type: Literal["input_file"]
+    file_data: FileData
+
+
+ContentItem = Union[ContentItemText, ContentItemFile]
+
+
+class Message(BaseModel):
+    role: Literal["user", "assistant", "system"] = "user"
+    content: List[ContentItem]
+
+
+class ChatPayload(BaseModel):
+    messages: List[Message] = Field(default_factory=list)

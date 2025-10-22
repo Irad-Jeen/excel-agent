@@ -5,6 +5,7 @@ from typing import Any
 from langchain.agents import create_react_agent, AgentExecutor, Tool
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from .xl_readers import load_workbook
 from .schemas import ControllerSummary
 
@@ -40,10 +41,6 @@ def _make_llm():
 # Tools (single string input)
 # =========================
 def _parse_json_input(input_str: str) -> dict:
-    """
-    ReAct agent passes a single string. We expect a JSON string.
-    Return {} if empty; raise with a clear message if invalid.
-    """
     input_str = (input_str or "").strip()
     if not input_str:
         return {}
@@ -67,6 +64,7 @@ def summarize_sheet_tool(input_str: str) -> str:
         if sheet_name not in xls.sheet_names:
             return f"❌ Sheet '{sheet_name}' not found. Available: {xls.sheet_names}"
 
+        import pandas as pd
         df = xls.parse(sheet_name)
         preview = df.head(20).to_csv(index=False)
         return (
@@ -125,13 +123,12 @@ def create_excel_agent() -> AgentExecutor:
         ),
     ]
 
-    # Prompt required vars: input, tools, tool_names, agent_scratchpad
     template = """You are an expert Excel analyst. You have tools you can call.
 
 TOOLS:
 {tools}
 
-You can reason step-by-step. When you need to use a tool, follow EXACTLY this format:
+When you need to use a tool, follow EXACTLY this format:
 Thought: what you think you need to do
 Action: the tool name (one of: {tool_names})
 Action Input: a single JSON string with the tool arguments
@@ -160,12 +157,9 @@ Question:
 
 
 # =========================
-# Run agent
+# Run Excel agent
 # =========================
 def run_excel_agent(file_path: str, controller_summary: ControllerSummary, query: str) -> str:
-    """
-    Run the ReAct agent to answer a user's question about the Excel file.
-    """
     agent = create_excel_agent()
 
     context = f"""You are analyzing an Excel workbook uploaded by the user.
@@ -178,8 +172,31 @@ File path to use: {file_path}
 User Query: {query}"""
 
     try:
-        # ReAct expects single "input" param
         result = agent.invoke({"input": context})
         return result.get("output", "❌ No output returned from agent.")
     except Exception as e:
         return f"❌ Agent failed to process query: {e}"
+
+
+# =========================
+# Run text-only agent (no Excel required)
+# =========================
+def run_text_agent(query: str) -> str:
+    """
+    Answers general questions that do NOT require reading an Excel file.
+    Output is short (<= 120 words).
+    """
+    llm = _make_llm()
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system",
+             "You are a concise business analyst. "
+             "If the user's question can be answered without reading a file, answer directly in under 120 words. "
+             "If the question clearly requires specific data from a file, briefly state what data is needed."),
+            ("user", "{q}"),
+        ]
+    )
+    chain = prompt | llm
+    msg = chain.invoke({"q": query})
+    # ChatOpenAI via LangChain returns an AIMessage with .content
+    return getattr(msg, "content", "").strip() or "Done."

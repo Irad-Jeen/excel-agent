@@ -1,88 +1,148 @@
 from __future__ import annotations
 import os
-import pandas as pd
-from fastapi import HTTPException
+import uuid
+import base64
+import re
+import json
+from datetime import datetime
+from typing import List, Optional
 
-from .schemas import (
-    ControllerSummary, FileMetadata, SheetQuickSummary,
-    SheetAIAnalysis, WorkbookAIOverview, AgentPayload
-)
-from .utils import get_file_metadata
+from fastapi import APIRouter, HTTPException, Body
 from .xl_readers import load_workbook
-from .llm_client import analyze_sheet_with_ai, analyze_workbook_overview
-from .agent_service import run_excel_agent
+from .agent_service import run_excel_agent, run_text_agent
+from .schemas import (
+    ControllerSummary,
+    ControllerSheetSummary,
+    ControllerMetadata,
+    ChatPayload,
+)
+
+router = APIRouter()
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# ----------------------------------------------------------
-# 🧠 פונקציה ראשית – סיכום הקובץ והגיליונות
-# ----------------------------------------------------------
+def _unique_filename(original_name: str) -> str:
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    rand = uuid.uuid4().hex[:8]
+    base, ext = os.path.splitext(original_name)
+    safe_base = base.replace(" ", "_")
+    return f"{stamp}_{rand}_{safe_base}{ext}"
 
-def summarize_workbook(file_path: str):
-    size, mime = get_file_metadata(file_path)
-    xls = load_workbook(file_path)
 
-    per_sheet: list[SheetQuickSummary] = []
-    ai_results: list[SheetAIAnalysis] = []
-    workbook_previews: dict[str, str] = {}
-
+def _build_controller_summary(saved_path: str, original_name: str) -> ControllerSummary:
+    xls = load_workbook(saved_path)
+    per_sheet: List[ControllerSheetSummary] = []
     for name in xls.sheet_names:
         df = xls.parse(name)
-        n_rows, n_cols = df.shape
-        columns = [str(c) for c in df.columns.tolist()]
-
-        per_sheet.append(SheetQuickSummary(
-            name=name, n_rows=n_rows, n_cols=n_cols, columns=columns
-        ))
-
-        preview_csv = df.head(10).to_csv(index=False)
-        workbook_previews[name] = (
-            f"Columns: {', '.join(columns[:30])}\n"
-            f"Preview CSV:\n{preview_csv}"
+        per_sheet.append(
+            ControllerSheetSummary(
+                name=name,
+                n_rows=int(df.shape[0]),
+                n_cols=int(df.shape[1]),
+                columns=[str(c) for c in df.columns.tolist()],
+            )
         )
-
-        analysis = analyze_sheet_with_ai(name, preview_csv)
-        ai_results.append(SheetAIAnalysis(sheet=name, analysis=analysis))
-
-    overview = analyze_workbook_overview(workbook_previews)
-    workbook_ai = WorkbookAIOverview(
-        purpose=overview.get("purpose",""),
-        key_entities=overview.get("key_entities",[]),
-        key_metrics=overview.get("key_metrics",[]),
-        time_ranges=overview.get("time_ranges",[]),
-        data_quality_notes=overview.get("data_quality_notes",[]),
-        suggested_questions=overview.get("suggested_questions",[]),
+    meta = ControllerMetadata(
+        filename=os.path.basename(saved_path),
+        size_bytes=os.path.getsize(saved_path),
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        original_name=original_name,
     )
-
-    controller_summary = ControllerSummary(
-        metadata=FileMetadata(filename=os.path.basename(file_path), size_bytes=size, mime_type=mime),
-        per_sheet=per_sheet
-    )
-    agent_payload = AgentPayload(
-        file_path=file_path,
-        controller_summary=controller_summary,
-        workbook_ai=workbook_ai,
-    )
-    return controller_summary, ai_results, workbook_ai, agent_payload
+    return ControllerSummary(metadata=meta, per_sheet=per_sheet)
 
 
-# ----------------------------------------------------------
-# 🤖 פונקציה חדשה – הרצת הסוכן על הקובץ
-# ----------------------------------------------------------
+# ---------- Heuristic: does the query REQUIRE the actual Excel data? ----------
+_REQUIRE_DATA_PATTERNS = re.compile(
+    r"(analy[sz]e|compute|calculate|find|list|show|extract|detect|"
+    r"top|largest|variance|yoy|trend|pivot|vlookup|sum|avg|median|"
+    r"compare|correlate|forecast|outlier|inconsisten|mismatch)",
+    re.IGNORECASE,
+)
+_EXCEL_TARGET_PATTERNS = re.compile(
+    r"(my\s+(excel|workbook|sheet|file)|this\s+(excel|workbook|sheet|file)|"
+    r"the\s+workbook|the\s+sheet|in\s+the\s+file|attached\s+excel)",
+    re.IGNORECASE,
+)
 
-def run_agent_on_excel(file_path: str, query: str):
+def _query_requires_excel(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if re.search(r"(analy[sz]e|inspect|process)\s+(the|my|this)\s+(excel|workbook|sheet|file)", t, re.IGNORECASE):
+        return True
+    if _REQUIRE_DATA_PATTERNS.search(t) and _EXCEL_TARGET_PATTERNS.search(t):
+        return True
+    # שאלות ידע (what/how/why/when/which) ללא רפרנס לקובץ → לא דורש קובץ
+    if re.match(r"^\s*(what|how|why|when|which)\b", t, re.IGNORECASE):
+        return False
+    return False
+
+
+# ------------------------------ JSON-only: /chat/analyze ------------------------------
+@router.post("/chat/analyze")
+async def chat_analyze(payload: ChatPayload = Body(...)):
     """
-    מפעיל את סוכן ה-AI (LangChain ReAct) על קובץ Excel.
-    מקבל שאילתה חופשית ומחזיר תשובת AI על סמך הנתונים.
+    קלט יחיד: JSON עם messages.
+    אם מצורף אקסל ב-Base64 -> ננתח. אחרת:
+      - אם לא חובה אקסל -> נענה מיד (בעזרת Gemma).
+      - אם חובה -> נחזיר בקשה לצרף קובץ.
+    פלט: {"agent_answer": "..."} בלבד.
     """
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+    texts: List[str] = []
+    excel_file_bytes: Optional[bytes] = None
+    excel_original_name: Optional[str] = None
 
-    controller_summary, _, _, _ = summarize_workbook(file_path)
+    for msg in payload.messages:
+        for part in msg.content:
+            if part.type == "text" and part.text:
+                texts.append(part.text.strip())
+            elif part.type == "input_file" and part.file_data:
+                # נשתמש רק באקסל (נשמיט קבצים אחרים, למשל PDF)
+                mt = (part.file_data.mime_type or "").lower()
+                if "spreadsheetml" in mt and excel_file_bytes is None:
+                    try:
+                        # נדרש Base64 מלא ללא 'data:;base64,' וללא '...'
+                        excel_file_bytes = base64.b64decode(part.file_data.data)
+                        excel_original_name = part.file_data.name or "uploaded.xlsx"
+                    except Exception:
+                        # אם היוון שגוי, נמשיך כאילו לא הגיע קובץ
+                        excel_file_bytes = None
 
-    # מפעיל את ה-Agent עם הנתיב והסיכום
+    query = " ".join([t for t in texts if t]).strip() or "Analyze the Excel workbook."
+
+    # אם יש קובץ אקסל → ננתח
+    if excel_file_bytes:
+        try:
+            original_name = excel_original_name or "uploaded.xlsx"
+            save_name = _unique_filename(original_name)
+            save_path = os.path.join(DATA_DIR, save_name)
+            with open(save_path, "wb") as f:
+                f.write(excel_file_bytes)
+
+            controller_summary = _build_controller_summary(save_path, original_name)
+            agent_answer = run_excel_agent(
+                file_path=save_path,
+                controller_summary=controller_summary,
+                query=query,
+            )
+            return {"agent_answer": agent_answer}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
+    # אין קובץ: נחליט אם צריך
+    if _query_requires_excel(query):
+        return {
+            "agent_answer": (
+                "This request requires the actual Excel data to compute or verify results. "
+                "Please attach a .xlsx file (Base64 in messages) so I can analyze the workbook."
+            )
+        }
+
+    # לא צריך קובץ -> תשובה קצרה ישירה
     try:
-        answer = run_excel_agent(file_path, controller_summary, query)
+        direct_answer = run_text_agent(query)
+        return {"agent_answer": direct_answer}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent failed: {e}")
-
-    return {"query": query, "answer": answer}
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
