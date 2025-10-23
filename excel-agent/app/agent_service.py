@@ -270,6 +270,7 @@ def create_excel_agent() -> AgentExecutor:
                 "Call any Excel tool via a router.\n"
                 "INPUT: either a JSON object or a JSON string with fields {tool, input}.\n"
                 "Only the 5 allowed tools for this request are available.\n"
+                "IMPORTANT: Inside Action Input, 'tool' must be one of the allowed Excel tools — never 'Invoke'."
             ),
         )
     ]
@@ -293,6 +294,9 @@ Rules:
 - Use at most 5 Invoke calls total (prefer 2–4). If still uncertain, finalize.
 - Operate only on the current workbook and, if specified, only the locked sheet.
 - Before your first Action, include a one-line Tool Plan: name up to 3 candidate tools with 1-line reasons and pick 1.
+- Only answer what was asked. Do NOT add extra totals/metrics unless explicitly requested.
+- If the question is definitional/explanatory (e.g., "what is/means/explain"), avoid computations; use minimal evidence (SheetPreview/FindRows/SummarizeSheet) and finalize.
+- Each tool in the Tool Plan MUST state why it changes the final answer; if it won't, skip the call and finalize.
 - Totals-first: if the user asks for totals, try TotalsRow (or YoYForLabel) before ComputeAggregate.
  - Totals-first: if the user asks for totals or sums, try TotalsRow (or YoYForLabel) before ComputeAggregate. If ComputeAggregate is used, prefer existing total rows when present.
  - Totals-first: if the user asks for totals or sums, try TotalsRow (or YoYForLabel) before ComputeAggregate. When multiple totals exist (e.g., Revenues vs Expenses), choose the one whose label best matches the user’s target (e.g., contains "expenses"). If not specified, prefer Expenses over Revenues.
@@ -304,6 +308,7 @@ Rules:
  - If a tool requires specific parameter names (e.g., ComputeAggregate expects 'values'), correct the parameter names and retry once.
  - For sheet relationships: first use InferSheetRelations to propose column mappings and sheet roles; then optionally verify with SheetColumns/FindRows/DetectTables.
 - If a total is already present in the sheet (TotalsRow returns it), do not recompute via ComputeAggregate unless TotalsRow fails or is absent.
+- Never call the router recursively: do NOT set tool=Invoke in Action Input. When you have the answer, stop calling tools and write Final Answer.
 - Finish with: Final Answer: <concise answer to the user>.
 
 Question:
@@ -334,7 +339,8 @@ Question:
             "Your last message did not follow the exact 4-block format.\n"
             "Produce ONLY:\n"
             "Thought: ...\nAction: Invoke\nAction Input: {\"tool\":\"<ToolName>\",\"input\":{...}}\nObservation: ...\n"
-            "No backticks. No code fences. No extra prose around Action Input."
+            "No backticks. No code fences. No extra prose around Action Input.\n"
+            "Do NOT set tool=Invoke inside Action Input; use a specific tool or finalize the answer."
         ),
     )
     return executor

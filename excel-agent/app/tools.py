@@ -289,13 +289,26 @@ def find_rows_tool(input_str: str) -> str:
     try:
         d = _parse_json_input(input_str)
         df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
-        label_cols = d.get("label_columns") or [str(df.columns[0])]
+        # Use top label-like columns by default (e.g., Category, Subcategory)
+        label_cols = d.get("label_columns") or _first_label_cols(df, k=2)
+        # Support alias: label_regex
+        query = d.get("query") or d.get("label_regex") or ".*"
         out = _find_rows_by_label(
             df, label_cols,
-            d.get("query", ".*"),
-            regex=bool(d.get("regex", True)),
+            query,
+            regex=bool(d.get("regex", True) or d.get("label_regex") is not None),
             case_insensitive=True
         )
+        # Optional column selection
+        select = d.get("select")
+        if select:
+            cols = [c for c in select if c in out.columns]
+            if cols:
+                out = out[cols]
+        # Optional row limit
+        limit = int(d.get("limit") or d.get("row_limit") or 0)
+        if limit and limit > 0:
+            out = out.head(limit)
         return json.dumps({
             "matched": out.to_dict(orient="records"),
             "idx": out.index.tolist()
