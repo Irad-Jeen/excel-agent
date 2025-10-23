@@ -1,7 +1,7 @@
 # app/agent_service.py
 from __future__ import annotations
 import os, json, re, ast
-from typing import Any, Dict, Callable, Union
+from typing import Any, Dict, Callable, Union, Optional, Set, List
 from langchain.agents import create_react_agent, AgentExecutor, Tool
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
@@ -32,7 +32,52 @@ from .tools import (
     detect_tables_tool,
     explain_sheet_purpose_tool,
     describe_tools_tool,
+    infer_sheet_relations_tool,
 )
+
+# =========================
+# Per-request guardrails and dynamic tool profiles
+# =========================
+# These module-level variables are set just-in-time by run_excel_agent and
+# cleared immediately after the agent invocation finishes.
+_REQUEST_FILE_PATH: Optional[str] = None
+_REQUEST_SHEET_LOCK: Optional[str] = None
+_ALLOWED_TOOLS_CURRENT: Optional[Set[str]] = None
+
+# Profiles: each request exposes ONLY these 5 tools to the agent
+_PROFILE_TOOLSETS: Dict[str, Set[str]] = {
+    "general_explore": {
+        "ListSheets", "SummarizeSheet", "SheetPreview", "FindRows", "ComputeAggregate"
+    },
+    "time_series": {
+        "DetectYearColumns", "YoYTable", "FindRows", "TotalsRow", "ComputeAggregate"
+    },
+    "quality_structure": {
+        "SheetColumns", "QualityReport", "DetectTables", "DetectTotalColumns", "DetectSubtotalRows"
+    },
+    "transform_pivot": {
+        "FilterRows", "ComputeAggregate", "PivotMini", "TotalsRow", "SheetPreview"
+    },
+    "relationships": {
+        "InferSheetRelations", "ListSheets", "SheetColumns", "FindRows", "DetectTables"
+    },
+}
+
+def _select_profile(query: str) -> Set[str]:
+    t = (query or "").lower()
+    # Prefer totals-aware toolkit when user asks for sum/total
+    if re.search(r"\b(total|totals|grand\s*total|sum)\b", t):
+        return _PROFILE_TOOLSETS["time_series"]
+    # Relationship intent: map/link/relate/structure/schema/dimension/reference between sheets
+    if re.search(r"\b(relationship|relat(e|ion)|map(ping)?|link(age)?|structure|schema|dimension|reference)\b", t):
+        return _PROFILE_TOOLSETS["relationships"]
+    if re.search(r"\b(yoy|trend|growth|delta|202[0-9])\b", t):
+        return _PROFILE_TOOLSETS["time_series"]
+    if re.search(r"\b(missing|null|quality|schema|structure|subtotal|total column|tables?)\b", t):
+        return _PROFILE_TOOLSETS["quality_structure"]
+    if re.search(r"\b(pivot|group|aggregate|mean|median|top\s*n|filter)\b", t):
+        return _PROFILE_TOOLSETS["transform_pivot"]
+    return _PROFILE_TOOLSETS["general_explore"]
 
 # =========================
 # LLM: Gemma via OpenRouter  (עם stop tokens נגד ``` וקוד-פנסינג)
@@ -118,6 +163,7 @@ TOOL_REGISTRY: Dict[str, Callable[[str], str]] = {
     "TopNChanges":            topn_changes_tool,
     "PivotMini":              pivot_mini_tool,
     "FilterRows":             filter_rows_tool,
+    "InferSheetRelations":    infer_sheet_relations_tool,
     "DescribeTools":          describe_tools_tool,
 }
 
@@ -159,6 +205,14 @@ def _invoke_router(input_any: Union[str, Dict[str, Any]]) -> str:
     tool_name = TOOL_ALIASES.get(tool_name.replace(" ", "").lower(), tool_name)
     tool_input = data.get("input")
 
+    # Enforce per-request allowed tools (dynamic 5-tool profile)
+    allowed: Set[str] = _ALLOWED_TOOLS_CURRENT or set(TOOL_REGISTRY.keys())
+    if tool_name and tool_name not in allowed:
+        return json.dumps({
+            "error": f"Invoke: tool '{tool_name}' is not allowed in this request.",
+            "allowed": sorted(list(allowed)),
+        }, ensure_ascii=False)
+
     if not tool_name:
         return json.dumps({"error": "Invoke: missing 'tool'."}, ensure_ascii=False)
     if tool_name not in TOOL_REGISTRY:
@@ -167,12 +221,34 @@ def _invoke_router(input_any: Union[str, Dict[str, Any]]) -> str:
             "hint": f"Use one of: {sorted(TOOL_REGISTRY.keys())}"
         }, ensure_ascii=False)
 
-    if isinstance(tool_input, dict):
-        tool_input = json.dumps(tool_input, ensure_ascii=False)
-    elif tool_input is None:
-        tool_input = "{}"
-    elif not isinstance(tool_input, str):
-        return json.dumps({"error": "Invoke: 'input' must be a JSON string or object."}, ensure_ascii=False)
+    # Sanitize and lock inputs to the current request (file path, optional sheet)
+    try:
+        input_dict: Dict[str, Any]
+        if isinstance(tool_input, dict):
+            input_dict = tool_input
+        elif tool_input is None:
+            input_dict = {}
+        elif isinstance(tool_input, str):
+            input_dict = _coerce_to_dict(tool_input)
+        else:
+            return json.dumps({"error": "Invoke: 'input' must be a JSON string or object."}, ensure_ascii=False)
+
+        if _REQUEST_FILE_PATH:
+            input_dict["file_path"] = _REQUEST_FILE_PATH
+        if _REQUEST_SHEET_LOCK is not None:
+            # Enforce sheet lock if set; auto-inject if missing
+            sheet = input_dict.get("sheet_name")
+            if sheet is None:
+                input_dict["sheet_name"] = _REQUEST_SHEET_LOCK
+            elif str(sheet) != str(_REQUEST_SHEET_LOCK):
+                return json.dumps({
+                    "error": "Invoke: sheet_name is locked for this request.",
+                    "required_sheet_name": _REQUEST_SHEET_LOCK,
+                }, ensure_ascii=False)
+
+        tool_input = json.dumps(input_dict, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"Invoke: failed to sanitize input: {e}"}, ensure_ascii=False)
 
     try:
         fn = TOOL_REGISTRY[tool_name]
@@ -193,17 +269,13 @@ def create_excel_agent() -> AgentExecutor:
             description=(
                 "Call any Excel tool via a router.\n"
                 "INPUT: either a JSON object or a JSON string with fields {tool, input}.\n"
-                "Format: {\"tool\":\"<One of: "
-                + ", ".join(sorted(TOOL_REGISTRY.keys()))
-                + ">\", \"input\": {<tool-args>}}\n"
-                "Example (object): {\"tool\":\"SheetColumns\",\"input\":{\"file_path\":\"/path.xlsx\",\"sheet_name\":\"P&L Insurance YOY\"}}\n"
-                "Example (string): \"{\\\"tool\\\":\\\"SheetColumns\\\",\\\"input\\\":{\\\"file_path\\\":\\\"/path.xlsx\\\",\\\"sheet_name\\\":\\\"P&L Insurance YOY\\\"}}\""
+                "Only the 5 allowed tools for this request are available.\n"
             ),
         )
     ]
 
     # ✅ פרומפט מוקשח — אין פנסינג, אין טקסט מסביב, 4 שורות בלבד
-    template = """You are an expert Excel analyst. Use the single tool "Invoke" to run any operation.
+    template = """You are an expert Excel analyst. Use the single tool "Invoke" to run operations.
 
 AVAILABLE TOOLS (via Invoke):
 {tools}
@@ -218,6 +290,20 @@ Rules:
 - NEVER use backticks or code fences.
 - NEVER include extra prose on the Action Input line; it must be a raw JSON object.
 - If a tool fails, read its error JSON and try a corrective next step.
+- Use at most 5 Invoke calls total (prefer 2–4). If still uncertain, finalize.
+- Operate only on the current workbook and, if specified, only the locked sheet.
+- Before your first Action, include a one-line Tool Plan: name up to 3 candidate tools with 1-line reasons and pick 1.
+- Totals-first: if the user asks for totals, try TotalsRow (or YoYForLabel) before ComputeAggregate.
+ - Totals-first: if the user asks for totals or sums, try TotalsRow (or YoYForLabel) before ComputeAggregate. If ComputeAggregate is used, prefer existing total rows when present.
+ - Totals-first: if the user asks for totals or sums, try TotalsRow (or YoYForLabel) before ComputeAggregate. When multiple totals exist (e.g., Revenues vs Expenses), choose the one whose label best matches the user’s target (e.g., contains "expenses"). If not specified, prefer Expenses over Revenues.
+ - If TotalsRow returns null on a sheet, compute the total: use ComputeAggregate with detected year columns (e.g., year=2024) and sum across values; return both per-column sums and total_sum.
+ - If TotalsRow returns null on a sheet, compute the total: use ComputeAggregate with detected year columns (e.g., year=2024) and, when appropriate, restrict rows by label_regex (e.g., (?i)\bExpenses\b) derived from the user intent or sheet structure. Return both per-column sums and total_sum.
+ - If TotalsRow returns null on a sheet, compute the total: use ComputeAggregate with detected year columns (e.g., year=2024), prefer monthly columns, and restrict rows by target intent (e.g., target:"expenses") or label_regex. Return both per-column sums and total_sum.
+- Do not use ComputeRatio for sums; it is for ratios only.
+- If router returns a misuse hint, do exactly one corrective retry with the suggested tool and stay within 5 calls.
+ - If a tool requires specific parameter names (e.g., ComputeAggregate expects 'values'), correct the parameter names and retry once.
+ - For sheet relationships: first use InferSheetRelations to propose column mappings and sheet roles; then optionally verify with SheetColumns/FindRows/DetectTables.
+- If a total is already present in the sheet (TotalsRow returns it), do not recompute via ComputeAggregate unless TotalsRow fails or is absent.
 - Finish with: Final Answer: <concise answer to the user>.
 
 Question:
@@ -226,7 +312,9 @@ Question:
 {agent_scratchpad}"""
 
     example_path = "/path/to/workbook.xlsx"
-    tool_names = ", ".join(sorted(TOOL_REGISTRY.keys()))
+    # Only show the 5 tools allowed for this request in the prompt
+    allowed_for_prompt: List[str] = sorted(list(_ALLOWED_TOOLS_CURRENT or set(TOOL_REGISTRY.keys())))
+    tool_names = ", ".join(allowed_for_prompt)
 
     prompt = PromptTemplate(
         template=template,
@@ -240,7 +328,7 @@ Question:
         agent=agent,
         tools=tools,
         verbose=True,
-        max_iterations=8,                  # לא להסתחרר בלופים
+        max_iterations=6,                  # Up to 5 tool calls + final
         early_stopping_method="generate",  # אם נתקע, לייצר Final Answer
         handle_parsing_errors=(
             "Your last message did not follow the exact 4-block format.\n"
@@ -255,6 +343,38 @@ Question:
 # Run Excel agent
 # =========================
 def run_excel_agent(file_path: str, controller_summary: ControllerSummary, query: str) -> str:
+    # Determine a reasonable sheet lock: single-sheet workbooks or explicit mention in query.
+    # If the query clearly requests a cross-sheet comparison, do NOT set a sheet lock.
+    sheet_lock: Optional[str] = None
+    try:
+        sheet_names = [s.name for s in controller_summary.per_sheet]
+        q = (query or "").strip().lower()
+        # Detect cross-sheet intent: mentions of 2+ known sheets or compare-like phrasing
+        mentions = [name for name in sheet_names if name.lower() in q]
+        cross_sheet = (len(mentions) >= 2) or bool(re.search(r"\b(compare|vs\.?|versus|between)\b", q))
+
+        if cross_sheet:
+            sheet_lock = None
+        elif len(sheet_names) == 1:
+            sheet_lock = sheet_names[0]
+        else:
+            # try exact (case-insensitive) match of a single sheet name mentioned in the query
+            for name in sheet_names:
+                if name.lower() in q:
+                    sheet_lock = name
+                    break
+    except Exception:
+        sheet_lock = None
+
+    # Choose the dynamic 5-tool profile for this request
+    allowed_tools = _select_profile(query)
+
+    # Set per-request globals
+    global _REQUEST_FILE_PATH, _REQUEST_SHEET_LOCK, _ALLOWED_TOOLS_CURRENT
+    _REQUEST_FILE_PATH = file_path
+    _REQUEST_SHEET_LOCK = sheet_lock
+    _ALLOWED_TOOLS_CURRENT = allowed_tools
+
     agent = create_excel_agent()
     context = f"""You are analyzing an Excel workbook uploaded by the user.
 
@@ -269,6 +389,11 @@ User Query: {query}"""
         return result.get("output", "❌ No output returned from agent.")
     except Exception as e:
         return f"❌ Agent failed to process query: {e}"
+    finally:
+        # Clear per-request globals to avoid cross-request leakage
+        _REQUEST_FILE_PATH = None
+        _REQUEST_SHEET_LOCK = None
+        _ALLOWED_TOOLS_CURRENT = None
 
 # =========================
 # Run text-only agent

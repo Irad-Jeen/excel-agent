@@ -316,7 +316,35 @@ def totals_row_tool(input_str: str) -> str:
         years = info["years"]
         selection = {}
         cols_used = []
-        row = cand.iloc[0]
+
+        # Heuristic: choose the most appropriate total row among candidates
+        # 1) Exact match: "Total Expenses" preferred, then "Total Revenues", then any "Total ... Expenses", then "Total ... Revenues"
+        # 2) If none, choose the candidate with the shortest label text that contains 'total'
+        def _label_text(r) -> str:
+            return " | ".join(str(r[c]) for c in label_cols if c in df.columns).strip()
+
+        labels = [(_label_text(r), idx) for idx, r in cand.iterrows()]
+        # Normalize
+        norm = [(re.sub(r"\s+", " ", (t or "").strip()), idx) for t, idx in labels]
+        # Ranking rules
+        def _rank(label: str) -> tuple:
+            l = label.lower()
+            # exact priority
+            if re.match(r"^\s*total\s+expenses\b", l):
+                return (0, len(l))
+            if re.match(r"^\s*total\s+revenue(s)?\b", l):
+                return (1, len(l))
+            if re.match(r"^\s*total\b.*\bexpenses\b", l):
+                return (2, len(l))
+            if re.match(r"^\s*total\b.*\brevenue(s)?\b", l):
+                return (3, len(l))
+            # generic total
+            if re.match(r"^\s*total\b", l):
+                return (4, len(l))
+            return (9, len(l))
+
+        best_idx = min(norm, key=lambda x: _rank(x[0]))[1]
+        row = cand.loc[best_idx]
         if years:
             for y in years:
                 cols = info["actual"].get(y) or info["map"].get(y) or []
@@ -330,10 +358,22 @@ def totals_row_tool(input_str: str) -> str:
                         cols_used.append(c)
                 if vals:
                     selection[y] = sum(vals)
-            return json.dumps({"totals": selection, "columns_used": cols_used}, ensure_ascii=False)
+            # Also return all candidate labels with ranks to help the agent disambiguate
+            candidates_meta = [{"label": t, "rank": _rank(t)[0]} for t, _ in norm]
+            return json.dumps({
+                "totals": selection,
+                "columns_used": cols_used,
+                "label_used": _label_text(row),
+                "candidates": candidates_meta
+            }, ensure_ascii=False)
         else:
             nums = pd.to_numeric(row, errors="coerce")
-            return json.dumps({"totals": {"all_numeric_sum": float(nums.dropna().sum())}}, ensure_ascii=False)
+            candidates_meta = [{"label": t, "rank": _rank(t)[0]} for t, _ in norm]
+            return json.dumps({
+                "totals": {"all_numeric_sum": float(nums.dropna().sum())},
+                "label_used": _label_text(row),
+                "candidates": candidates_meta
+            }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"TotalsRow: {e}"}, ensure_ascii=False)
 
@@ -415,7 +455,40 @@ def compute_aggregate_tool(input_str: str) -> str:
     try:
         d = _parse_json_input(input_str)
         df = _normalize_columns(_load_df(d["file_path"], d["sheet_name"]))
-        values = d.get("values")
+        # Accept aliases for values
+        values = d.get("values") or d.get("columns")
+        # Normalize target intent (e.g., expenses, revenues)
+        target = str(d.get("target") or d.get("label") or "").strip().lower()
+        target_regex: str | None = d.get("label_regex")
+        if not target_regex and target:
+            if "expense" in target:
+                target_regex = r"(?i)\bexpenses\b"
+            elif "revenue" in target or "income" in target:
+                target_regex = r"(?i)\brevenue(s)?\b|\bincome\b"
+            elif "profit" in target:
+                target_regex = r"(?i)\bprofit\b"
+        # If values not provided but year is, auto-detect columns for that year
+        # If values not provided but year is, auto-detect columns for that year
+        if not values and d.get("year") is not None:
+            info = _detect_year_columns(df)
+            y = str(int(d.get("year")))
+            detected = info["actual"].get(y) or info["map"].get(y) or []
+            # Prefer monthly columns when present
+            only_months = bool(d.get("only_months")) or any(re.search(r"[_\s-](0[1-9]|1[0-2])\b", str(c)) for c in detected)
+            if only_months:
+                detected = [c for c in detected if re.search(r"[_\s-](0[1-9]|1[0-2])\b", str(c))]
+            values = detected
+        # Optional pre-filter by label regex to restrict rows (e.g., only Expenses)
+        if target_regex:
+            label_cols = d.get("label_columns") or _first_label_cols(df)
+            df = _find_rows_by_label(df, label_cols, target_regex, regex=True)
+            if df.empty:
+                return json.dumps({"rows": [], "note": "Filter produced no rows"}, ensure_ascii=False)
+        elif d.get("label_regex"):
+            label_cols = d.get("label_columns") or _first_label_cols(df)
+            df = _find_rows_by_label(df, label_cols, d.get("label_regex"), regex=True)
+            if df.empty:
+                return json.dumps({"rows": [], "note": "Filter produced no rows"}, ensure_ascii=False)
         if not values:
             return json.dumps({"error": "ComputeAggregate: provide 'values' (list of COLUMN NAMES). Example: {\"values\":[\"Actual 2024\"]}"},
                               ensure_ascii=False)
@@ -430,16 +503,31 @@ def compute_aggregate_tool(input_str: str) -> str:
                                         f"Available (first 20): {list(map(str, df.columns))[:20]}"},
                               ensure_ascii=False)
 
-        agg = (d.get("agg") or "sum").lower()
+        # Accept aliases for agg
+        agg = (d.get("agg") or d.get("aggregate_type") or d.get("aggregate_function") or "sum").lower()
         agg_map = {"sum":"sum","avg":"mean","mean":"mean","min":"min","max":"max","median":"median","count":"count"}
         if agg not in agg_map:
             return json.dumps({"error": f"ComputeAggregate: unsupported agg '{agg}'. Use one of {list(agg_map)}"},
                               ensure_ascii=False)
 
+        # Prefer existing total row if present for simple sums without grouping
+        gb = d.get("group_by") or None
+        if agg == "sum" and not gb:
+            label_cols = d.get("label_columns") or _first_label_cols(df)
+            total_df = _infer_total_row(df, label_cols)
+            if not total_df.empty:
+                row = total_df.iloc[0]
+                out_row: Dict[str, Any] = {}
+                for c in values:
+                    v = pd.to_numeric(pd.Series([row.get(c)]), errors="coerce").iloc[0]
+                    if pd.notna(v):
+                        out_row[str(c)] = float(v)
+                if out_row:
+                    return json.dumps({"rows": [out_row], "source": "existing_total_row"}, ensure_ascii=False)
+
         for c in values:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        gb = d.get("group_by") or None
         if gb:
             if any(g not in df.columns for g in gb):
                 bad = [g for g in gb if g not in df.columns]
@@ -449,6 +537,10 @@ def compute_aggregate_tool(input_str: str) -> str:
         else:
             out = getattr(df[values], agg_map[agg])()
             out = out.to_frame().T
+            # Return a single total across the provided values when summing
+            if agg == "sum":
+                total_sum = float(out[values].sum(axis=1).iloc[0])
+                return json.dumps({"rows": out.to_dict(orient="records"), "total_sum": total_sum}, ensure_ascii=False)
 
         return json.dumps({"rows": out.to_dict(orient="records")}, ensure_ascii=False)
     except Exception as e:
@@ -665,6 +757,123 @@ def explain_sheet_purpose_tool(input_str: str) -> str:
         return json.dumps({"sheet": sheet_name, "analysis": analysis}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"ExplainSheetPurpose: {e}"}, ensure_ascii=False)
+
+# =========================
+# Tools — Relationships
+# =========================
+def _text_like_columns(df: pd.DataFrame) -> List[str]:
+    cols: List[str] = []
+    for c in df.columns:
+        s = df[c]
+        # consider object dtype or mixed columns as label-like
+        if s.dtype == "O":
+            cols.append(str(c))
+    return cols
+
+def _value_set(series: pd.Series, limit: int = 10000) -> set:
+    vals = set()
+    for v in series.dropna().astype(str).head(limit):
+        vv = v.strip()
+        if vv:
+            vals.add(vv)
+    return vals
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return float(inter / union) if union else 0.0
+
+def infer_sheet_relations_tool(input_str: str) -> str:
+    """
+    Infer likely relationships between sheets via column-name similarity and value overlaps.
+    Input: {"file_path": "/path.xlsx", "limit_per_sheet": 500}
+    Output: {"relations": [{"sheet_a":..., "sheet_b":..., "column_mappings":[{"a_col":...,"b_col":...,"name_similarity":...,"value_overlap":...}], "notes":[...] }], "summary": "..."}
+    """
+    try:
+        d = _parse_json_input(input_str)
+        file_path = d.get("file_path")
+        if not file_path:
+            return json.dumps({"error": "InferSheetRelations: Missing 'file_path'"}, ensure_ascii=False)
+        limit = int(d.get("limit_per_sheet", 1000))
+
+        xls = load_workbook(file_path)
+        sheets = xls.sheet_names
+        dfs: Dict[str, pd.DataFrame] = {}
+        for name in sheets:
+            df = xls.parse(name)
+            df = _normalize_columns(df)
+            if len(df) > limit:
+                df = df.head(limit)
+            dfs[name] = df
+
+        relations: List[Dict[str, Any]] = []
+        notes_global: List[str] = []
+
+        # Precompute text-like columns and year info
+        label_cols_by_sheet: Dict[str, List[str]] = {}
+        years_by_sheet: Dict[str, Dict[str, Any]] = {}
+        for name, df in dfs.items():
+            label_cols_by_sheet[name] = _first_label_cols(df, k=3)
+            years_by_sheet[name] = _detect_year_columns(df)
+
+        # Pairwise compare sheets
+        for i in range(len(sheets)):
+            for j in range(i + 1, len(sheets)):
+                a, b = sheets[i], sheets[j]
+                dfa, dfb = dfs[a], dfs[b]
+                a_labels = [c for c in _text_like_columns(dfa) if c in label_cols_by_sheet[a]]
+                b_labels = [c for c in _text_like_columns(dfb) if c in label_cols_by_sheet[b]]
+                if not a_labels or not b_labels:
+                    continue
+
+                mappings: List[Dict[str, Any]] = []
+                for ca in a_labels:
+                    set_a = _value_set(dfa[ca])
+                    for cb in b_labels:
+                        set_b = _value_set(dfb[cb])
+                        vo = _jaccard(set_a, set_b)
+                        if vo >= 0.2:  # heuristic threshold
+                            # name similarity (simple, lowercased token Jaccard)
+                            na = set(str(ca).lower().split())
+                            nb = set(str(cb).lower().split())
+                            name_sim = _jaccard(na, nb)
+                            samples = list((set_a & set_b))[:5]
+                            mappings.append({
+                                "a_col": str(ca),
+                                "b_col": str(cb),
+                                "name_similarity": float(name_sim),
+                                "value_overlap": float(vo),
+                                "sample_overlap_values": samples,
+                            })
+
+                rel_notes: List[str] = []
+                # If one sheet has years and the other is mostly labels, suggest structure→fact relation
+                a_has_years = bool(years_by_sheet[a].get("years"))
+                b_has_years = bool(years_by_sheet[b].get("years"))
+                if mappings:
+                    if a_has_years and not b_has_years:
+                        rel_notes.append("Sheet B likely defines hierarchy/labels used by sheet A.")
+                    if b_has_years and not a_has_years:
+                        rel_notes.append("Sheet A likely defines hierarchy/labels used by sheet B.")
+                    if a_has_years and b_has_years:
+                        rel_notes.append("Both sheets have time-series; mappings may represent shared dimensions.")
+
+                    relations.append({
+                        "sheet_a": a,
+                        "sheet_b": b,
+                        "column_mappings": mappings,
+                        "notes": rel_notes,
+                    })
+
+        summary = "Found {} relation candidates across {} sheets.".format(len(relations), len(sheets))
+        if not relations:
+            notes_global.append("No strong label overlaps detected; try adjusting label columns or increase limit.")
+
+        return json.dumps({"relations": relations, "summary": summary, "notes": notes_global}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"InferSheetRelations: {e}"}, ensure_ascii=False)
 
 # =========================
 # Tools — Meta (Docs)
